@@ -230,8 +230,10 @@ namespace System.Linq.Dynamic
         const string SYMBOL_ROOT = "~";
         const string KEYWORD_IIF = "iif";
         const string KEYWORD_NEW = "new";
+        const string KEYWORD_ISNULL = "isnull";
 
         static Dictionary<string, object> _keywords;
+		static Type _dbfunctionattr;
 
         Dictionary<string, object> _symbols;
         IDictionary<string, object> _externals;
@@ -247,7 +249,14 @@ namespace System.Linq.Dynamic
 
         public ExpressionParser(ParameterExpression[] parameters, string expression, object[] values)
         {
-            if (_keywords == null) _keywords = CreateKeywords();
+            if (_keywords == null)
+            {
+                _keywords = CreateKeywords();
+
+                // Getting DbFunctionAttribute type from Reflection to avoid an EntityFramework dependency.
+                // If EntityFramework is not loaded, _dbfunctionattr remains null and UDF support is disabled
+                _dbfunctionattr = Type.GetType("System.Data.Entity.DbFunctionAttribute, EntityFramework");
+            }
             _symbols = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
             _literals = new Dictionary<Expression, string>();
             if (parameters != null) ProcessParameters(parameters);
@@ -476,7 +485,18 @@ namespace System.Linq.Dynamic
                 switch (op.id)
                 {
                     case TokenId.Amphersand:
-                        left = Expression.And(left, right);
+                        // When at least one side of the operator is a string,
+                        // consider it's a VB-style concatenation operator.
+                        // Doesn't break any other function since logical AND with a string
+                        // is invalid anyway.
+                        if (left.Type == typeof(string) || right.Type == typeof(string))
+                        {
+                            left = GenerateStringConcat(left, right);
+                        }
+                        else
+                        {
+                            left = Expression.And(left, right);
+                        }
                         break;
                     case TokenId.Bar:
                         left = Expression.Or(left, right);
@@ -844,6 +864,8 @@ namespace System.Linq.Dynamic
                 if (value == (object)SYMBOL_ROOT) return ParseRoot();
                 if (value == (object)KEYWORD_IIF) return ParseIif();
                 if (value == (object)KEYWORD_NEW) return ParseNew();
+                if (value == (object)KEYWORD_ISNULL) return ParseIsNull();
+
                 NextToken();
                 return (Expression)value;
             }
@@ -899,6 +921,18 @@ namespace System.Linq.Dynamic
             if (args.Length != 3)
                 throw ParseError(errorPos, Res.IifRequiresThreeArgs);
             return GenerateConditional(args[0], args[1], args[2], errorPos);
+        }
+
+        Expression ParseIsNull()
+        {
+            int errorPos = _token.pos;
+            NextToken();
+            Expression[] args = ParseArgumentList();
+            if (args.Length != 2)
+                throw ParseError(errorPos, Res.IsNullRequiresTwoArgs);
+
+            return GenerateConditional(Expression.Equal(args[0], Expression.Constant(null, args[0].Type)), args[1],
+               args[0], errorPos);
         }
 
         Expression GenerateConditional(Expression test, Expression expr1, Expression expr2, int errorPos)
@@ -1079,6 +1113,76 @@ namespace System.Linq.Dynamic
                 MemberInfo member = FindPropertyOrField(type, id, instance == null);
                 if (member == null)
                 {
+#if !NET35
+                    // Allow Dynamic Linq to call UDF and any other function declared
+                    // with a DbFunctionAttribute. If EntityFramework is not loaded, this feature is disabled.
+
+                    // Note: This code may not be as efficient as it could be: no caching
+                    // is performed on method discovery.
+
+                    // A dot is detected, the full qualified name is extracted
+                    if (_dbfunctionattr != null && _token.id == TokenId.Dot)
+                    {
+                        var qualifiedName = new List<String> { id };
+                        while (_token.id == TokenId.Dot)
+                        {
+                            NextToken();
+                            if (_token.id == TokenId.Identifier)
+                            {
+                                qualifiedName.Add(GetIdentifier());
+                                NextToken();
+                            }
+                            else
+                            {
+                                throw ParseError(errorPos, Res.UnknownPropertyOrField, id, GetTypeName(type));
+                            }
+                        }
+                        // Once the qualified name is extracted, a parenthesis should be found
+                        if (_token.id == TokenId.OpenParen)
+                        {
+                            Expression[] args = ParseArgumentList();
+
+                            // The last part of the qualified name is assumed to be the method name
+                            var name = qualifiedName.Last();
+                            qualifiedName.RemoveAt(qualifiedName.Count - 1);
+
+                            // Using System.Web to find the type as it can be in any loaded assembly and Buildmanager already has an internal cache
+                            var memberType = Web.Compilation.BuildManager.GetType(String.Join(".", qualifiedName), false);
+                            if (memberType != null)
+                            {
+                                MethodBase mb;
+
+                                // Searching for the public shared method matching that name.
+                                // Case-insensitive search, this library is consumed by VB clients
+                                var members = memberType.FindMembers(
+                                   MemberTypes.Method,
+                                   BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly | BindingFlags.Static,
+                                   Type.FilterNameIgnoreCase, name);
+
+                                var count = FindBestMethod(members.Cast<MethodBase>(), args, out mb);
+
+                                // Only one "best method" allowed. A way to find out which of the best methods is more
+                                // suitable could be designed, but I doubt it's useful
+                                if (count > 1)
+                                {
+                                    throw ParseError(errorPos, Res.AmbiguousMethodInvocation, id, GetTypeName(type));
+                                }
+                                if (count == 1)
+                                {
+                                    var method = (MethodInfo)mb;
+
+                                    // Finally, if DbFunctionAttribute is present, the method is called.
+                                    // This detection could be moved up a bit, at least as a way to discriminate
+                                    // against multiple FindBestMethod results.
+                                    if (method.GetCustomAttributes(_dbfunctionattr, true).Length > 0)
+                                    {
+                                        return Expression.Call(null, method, args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+#endif
                     throw ParseError(errorPos, Res.UnknownPropertyOrField,
                         id, GetTypeName(type));
                 }
@@ -1497,6 +1601,10 @@ namespace System.Linq.Dynamic
                             case TypeCode.Int64:
                             case TypeCode.UInt64:
                                 value = ParseNumber(text, target);
+
+                                // Make sure an enum value stays an enum value
+                                if (target.IsEnum)
+                                    value = Enum.ToObject(target, value);
                                 break;
                             case TypeCode.Double:
                                 if (target == typeof(decimal)) value = ParseNumber(text, target);
@@ -1845,9 +1953,10 @@ namespace System.Linq.Dynamic
 
         static Expression GenerateStringConcat(Expression left, Expression right)
         {
+            // Allow concat String with something else
             return Expression.Call(
                 null,
-                typeof(string).GetMethod("Concat", new[] { typeof(object), typeof(object) }),
+                typeof(string).GetMethod("Concat", new[] { left.Type, right.Type }),
                 new[] { left, right });
         }
 
@@ -2141,6 +2250,7 @@ namespace System.Linq.Dynamic
             d.Add(SYMBOL_ROOT, SYMBOL_ROOT);
             d.Add(KEYWORD_IIF, KEYWORD_IIF);
             d.Add(KEYWORD_NEW, KEYWORD_NEW);
+            d.Add(KEYWORD_ISNULL, KEYWORD_ISNULL);
 
             foreach (Type type in _predefinedTypes) d.Add(type.Name, type);
             foreach (Type type in GlobalConfig.CustomTypeProvider.GetCustomTypes()) d.Add(type.Name, type);
